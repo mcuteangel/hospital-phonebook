@@ -6,6 +6,7 @@ const { toLatinDigits, cleanText, searchKey } = require('../lib/text');
 const { parseCsv, stringifyCsv, safeCell } = require('../lib/csv');
 const { parsePerson } = require('../lib/directory');
 const auth = require('../lib/auth');
+const enc = require('../lib/crypto');
 
 test('toLatinDigits: ارقام فارسی و عربی به لاتین', () => {
   assert.equal(toLatinDigits('۰۹۱۲٣٤٥'), '0912345');
@@ -63,4 +64,29 @@ test('scrypt: هش و تأیید رمز؛ هش ثابت نیست', async () => {
   assert.equal(await auth.verifyPassword('Secret-123', h1), true);
   assert.equal(await auth.verifyPassword('wrong', h1), false);
   assert.equal(await auth.verifyPassword('anything', null), false);
+});
+
+test('crypto: رفت‌وبرگشت AES-GCM؛ رشته خالی همان خالی می‌ماند', () => {
+  const key = Buffer.alloc(32, 7);
+  const cipher = enc.encryptValue(key, '09000001111');
+  assert.ok(cipher.startsWith('enc1:'));
+  assert.notEqual(cipher, '09000001111');
+  assert.equal(enc.decryptValue(key, cipher), '09000001111');
+  assert.equal(enc.encryptValue(key, ''), '');
+  assert.equal(enc.decryptValue(key, ''), '');
+  assert.equal(enc.decryptValue(key, 'متن رمزنشده قدیمی'), 'متن رمزنشده قدیمی');
+});
+
+test('crypto: کلید اشتباه یا متن دست‌کاری‌شده رمزگشایی نمی‌شود', () => {
+  const key = Buffer.alloc(32, 7);
+  const other = Buffer.alloc(32, 9);
+  const cipher = enc.encryptValue(key, '09000001111');
+  assert.throws(() => enc.decryptValue(other, cipher));
+  const tampered = cipher.slice(0, -2) + (cipher.endsWith('A') ? 'B' : 'A');
+  assert.throws(() => enc.decryptValue(key, tampered));
+});
+
+test('crypto: دو بار رمز کردن یک مقدار، خروجی متفاوت می‌دهد (IV تصادفی)', () => {
+  const key = Buffer.alloc(32, 7);
+  assert.notEqual(enc.encryptValue(key, '09000001111'), enc.encryptValue(key, '09000001111'));
 });

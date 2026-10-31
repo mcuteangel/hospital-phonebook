@@ -10,9 +10,10 @@
  */
 
 const { loadConfig, requireNode22 } = require('./lib/config');
-const { openDb } = require('./lib/db');
+const { openDb, transaction } = require('./lib/db');
 const auth = require('./lib/auth');
 const dir = require('./lib/directory');
+const enc = require('./lib/crypto');
 
 async function main() {
   requireNode22();
@@ -35,12 +36,28 @@ async function main() {
       break;
     }
     case 'set-password': {
-      if (!a) throw new Error('استفاده: node manage.js set-password <username>');
-      const row = db.prepare('SELECT id FROM users WHERE username = ?').get(a.toLowerCase());
+      if (!a) throw new Error('استفاده: node manage.js set-password <username> [رمز-فعلی]');
+      const row = db.prepare('SELECT id, role, password_hash FROM users WHERE username = ?').get(a.toLowerCase());
       if (!row) throw new Error('کاربر پیدا نشد');
       const password = auth.generatePassword();
-      await auth.setPassword(db, row.id, password);
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+      if (a.toLowerCase() === 'admin' && row.role === 'operator') {
+        // کلید رمزنگاری داده‌ها از رمز admin ساخته می‌شود؛ بدون رمز فعلی، بازرمز ممکن نیست
+        if (!b) throw new Error('برای admin رمز فعلی لازم است: node manage.js set-password admin <رمز-فعلی>');
+        const okOld = await auth.verifyPassword(b, row.password_hash);
+        if (!okOld) throw new Error('رمز فعلی اشتباه است');
+        const salt = enc.getOrCreateSalt(db);
+        const oldDek = await enc.deriveDek(b, salt);
+        const newDek = await enc.deriveDek(password, salt);
+        const newHash = await auth.hashPassword(password);
+        transaction(db, () => {
+          enc.reencryptAll(db, oldDek, newDek);
+          db.prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?').run(newHash, row.id);
+          db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+        });
+      } else {
+        await auth.setPassword(db, row.id, password);
+        db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+      }
       console.log(`رمز جدید «${a}»: ${password}`);
       break;
     }

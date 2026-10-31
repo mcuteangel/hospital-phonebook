@@ -79,7 +79,7 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (res.status === 401 && state.user) {
+      if (res.status === 401 && data.code !== 'locked' && state.user) {
         state.user = null;
         state.tab = 'internals';
         renderAll();

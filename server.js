@@ -5,9 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { loadConfig, requireNode22 } = require('./lib/config');
-const { openDb } = require('./lib/db');
+const { openDb, transaction } = require('./lib/db');
 const auth = require('./lib/auth');
 const dir = require('./lib/directory');
+const enc = require('./lib/crypto');
 const { writeSnapshot } = require('./lib/snapshot');
 const { HttpError } = require('./lib/errors');
 
@@ -87,6 +88,15 @@ function intParam(value, label) {
   return Number(value);
 }
 
+function isSensitiveOperatorRoute(method, pathname) {
+  if (pathname === '/api/persons' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/persons\/\d+$/.test(pathname) && (method === 'GET' || method === 'PUT')) return true;
+  if (pathname === '/api/recents' && method === 'GET') return true;
+  if (pathname === '/api/export.csv' && method === 'GET') return true;
+  if (pathname === '/api/import' && method === 'POST') return true;
+  return false;
+}
+
 function createApp({ db, publicDir, dataDir }) {
   const limiter = auth.createLimiter();
   const routes = [];
@@ -112,6 +122,13 @@ function createApp({ db, publicDir, dataDir }) {
     }
     limiter.reset(ip);
     const token = auth.createSession(db, row.id);
+    // فقط ورود admin قفل داده حساس را باز می‌کند (کلید از رمز او ساخته می‌شود)
+    if (row.username === 'admin' && row.role === 'operator') {
+      const salt = enc.getOrCreateSalt(db);
+      const dek = await enc.deriveDek(password, salt);
+      enc.setDek(dek);
+      transaction(db, () => enc.migratePlaintext(db, dek));
+    }
     res.setHeader('Set-Cookie', sessionCookie(token, Math.floor(auth.SESSION_TTL_MS / 1000)));
     send(res, 200, { user: { username: row.username, role: row.role, mustChangePassword: row.must_change_password === 1 } });
   });
@@ -127,8 +144,23 @@ function createApp({ db, publicDir, dataDir }) {
     const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
     const ok = await auth.verifyPassword(typeof b.current === 'string' ? b.current : '', row.password_hash);
     if (!ok) throw new HttpError(400, 'رمز فعلی اشتباه است');
-    await auth.setPassword(db, user.id, b.new);
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+    if (user.username === 'admin' && user.role === 'operator') {
+      // کلید داده از رمز admin ساخته می‌شود: همه ستون‌ها را با کلید جدید بازرمز می‌کنیم
+      auth.validatePassword(b.new);
+      const salt = enc.getOrCreateSalt(db);
+      const oldDek = await enc.deriveDek(typeof b.current === 'string' ? b.current : '', salt);
+      const newDek = await enc.deriveDek(b.new, salt);
+      const newHash = await auth.hashPassword(b.new);
+      transaction(db, () => {
+        enc.reencryptAll(db, oldDek, newDek);
+        db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(newHash, user.id);
+        db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+      });
+      enc.setDek(newDek);
+    } else {
+      await auth.setPassword(db, user.id, b.new);
+      db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+    }
     send(res, 200, { ok: true });
   });
 
@@ -291,6 +323,11 @@ function createApp({ db, publicDir, dataDir }) {
         && pathname !== '/api/logout' && pathname !== '/api/me/password') {
       throw new HttpError(403, 'ابتدا رمز عبور خود را تغییر دهید', 'password-change-required');
     }
+    // داده حساس قفل است تا وقتی admin از زمان راه‌اندازی سرور وارد نشده باشد؛
+    // فقط مسیرهایی که به ستون‌های حساس می‌رسند بسته می‌شوند (viewer هرگز به آنها نمی‌رسد)
+    if (user && user.role === 'operator' && !enc.getDek() && isSensitiveOperatorRoute(req.method, pathname)) {
+      throw new HttpError(401, enc.LOCKED_MESSAGE, 'locked');
+    }
     const url = new URL(req.url, 'http://localhost');
     await found.rt.handler({ req, res, user, params: found.params, query: url.searchParams });
   }
@@ -320,6 +357,7 @@ async function main() {
   const cfg = loadConfig();
   const db = openDb(cfg.dbFile);
   auth.purgeExpired(db);
+  enc.getOrCreateSalt(db);
 
   if (!db.prepare('SELECT 1 FROM users LIMIT 1').get()) {
     const password = auth.generatePassword();

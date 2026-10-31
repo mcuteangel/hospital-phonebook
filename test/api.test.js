@@ -9,6 +9,7 @@ const path = require('node:path');
 const { createApp } = require('../server');
 const { openDb } = require('../lib/db');
 const auth = require('../lib/auth');
+const enc = require('../lib/crypto');
 const dir = require('../lib/directory');
 
 // داده‌های کاملاً ساختگی
@@ -63,6 +64,9 @@ test.before(async () => {
   db = openDb(path.join(tmp, 'data', 'directory.db'));
   await auth.createUser(db, 'oper', 'operator', 'Operator-Test-1');
   await auth.createUser(db, 'viewer1', 'viewer', 'Viewer-Test-1');
+  await auth.createUser(db, 'admin', 'operator', 'Admin-Test-1');
+  ctx.salt = enc.getOrCreateSalt(db);
+  enc.setDek(await enc.deriveDek('Admin-Test-1', ctx.salt));
   ctx.groupId = dir.createGroup(db, { name: 'پزشکان', color: '#2563eb' });
   dir.createGroup(db, { name: 'خالی', color: '#16a34a' });
   dir.createPerson(db, {
@@ -338,6 +342,10 @@ test('تغییر رمز: رمز فعلی لازم است و رمز قدیمی ا
   assert.equal((await c.post('/api/me/password', { current: 'Viewer-Test-1', new: 'New-Password-9' })).status, 200);
   assert.equal((await client().post('/api/login', { username: 'viewer1', password: 'Viewer-Test-1' })).status, 401);
   await client().login('viewer1', 'New-Password-9');
+  // برگرداندن رمز تا تست‌های بعدی با رمز اصلی کار کنند
+  const c2 = client();
+  await c2.login('viewer1', 'New-Password-9');
+  assert.equal((await c2.post('/api/me/password', { current: 'New-Password-9', new: 'Viewer-Test-1' })).status, 200);
 });
 
 test('CSRF: درخواست تغییر با Origin بیگانه رد می‌شود', async () => {
@@ -360,6 +368,71 @@ test('تغییر رمز اجباری: تا وقتی رمز عوض نشده، ب�
   assert.equal(ch.status, 200, JSON.stringify(ch.data));
   assert.equal((await c.get('/api/me')).data.user.mustChangePassword, false);
   assert.equal((await c.get('/api/persons')).status, 200);
+});
+
+test('رمزنگاری: مقادیر حساس در دیتابیس رمز شده‌اند ولی از API خوانا برمی‌گردند', async () => {
+  const raw = db.prepare('SELECT mobile FROM persons WHERE last_name = ?').get('کریمی');
+  assert.ok(raw.mobile.startsWith('enc1:'), raw.mobile);
+  assert.ok(!raw.mobile.includes(FAKE_MOBILE));
+  const c = client();
+  await c.login('oper', 'Operator-Test-1');
+  const p = (await c.get('/api/persons?q=' + FAKE_MOBILE)).data.items[0];
+  assert.equal(p.mobile, FAKE_MOBILE);
+});
+
+test('قفل: بدون ورود admin، اپراتور به داده حساس نمی‌رسد ولی viewer کار می‌کند', async () => {
+  enc.clearDek();
+  try {
+    const oc = client();
+    await oc.login('oper', 'Operator-Test-1');
+    const r = await oc.get('/api/persons');
+    assert.equal(r.status, 401);
+    assert.equal(r.data.code, 'locked');
+    const vc = client();
+    await vc.login('viewer1', 'Viewer-Test-1');
+    assert.equal((await vc.get('/api/persons')).status, 200);
+  } finally {
+    enc.setDek(await enc.deriveDek('Admin-Test-1', ctx.salt));
+  }
+  const oc = client();
+  await oc.login('oper', 'Operator-Test-1');
+  assert.equal((await oc.get('/api/persons')).status, 200);
+});
+
+test('مهاجرت: مقادیر قدیمی رمزنشده در اولین ورود admin رمز می‌شوند', async () => {
+  const now = Date.now();
+  const res = db.prepare(
+    `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+       mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run('قدیمی', 'رمزنشده', '', null, '3999', '', '09000003333', '', '', '', '', '', now, now);
+  const id = Number(res.lastInsertRowid);
+  assert.equal(db.prepare('SELECT mobile FROM persons WHERE id = ?').get(id).mobile, '09000003333');
+  enc.clearDek();
+  const c = client();
+  await c.login('admin', 'Admin-Test-1');
+  assert.ok(db.prepare('SELECT mobile FROM persons WHERE id = ?').get(id).mobile.startsWith('enc1:'));
+  const oc = client();
+  await oc.login('oper', 'Operator-Test-1');
+  assert.equal((await oc.get('/api/persons/' + id)).data.person.mobile, '09000003333');
+});
+
+test('تغییر رمز admin: داده با کلید جدید بازرمز می‌شود و خوانا می‌ماند', async () => {
+  const before = db.prepare('SELECT mobile FROM persons WHERE last_name = ?').get('کریمی').mobile;
+  const c = client();
+  await c.login('admin', 'Admin-Test-1');
+  const ch = await c.post('/api/me/password', { current: 'Admin-Test-1', new: 'Admin-Test-2' });
+  assert.equal(ch.status, 200, JSON.stringify(ch.data));
+  const after = db.prepare('SELECT mobile FROM persons WHERE last_name = ?').get('کریمی').mobile;
+  assert.ok(after.startsWith('enc1:'));
+  assert.notEqual(after, before);
+  const oc = client();
+  await oc.login('oper', 'Operator-Test-1');
+  assert.equal((await oc.get('/api/persons?q=' + FAKE_MOBILE)).data.items[0].mobile, FAKE_MOBILE);
+  // برگرداندن رمز admin تا تست‌های بعدی (در صورت نیاز) با همان رمز کار کنند
+  const c2 = client();
+  await c2.login('admin', 'Admin-Test-2');
+  assert.equal((await c2.post('/api/me/password', { current: 'Admin-Test-2', new: 'Admin-Test-1' })).status, 200);
 });
 
 test('محدودیت تلاش ناموفق ورود: ۱۰ شکست و سپس ۴۲۹', async () => {

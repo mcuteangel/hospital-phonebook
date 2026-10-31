@@ -435,6 +435,88 @@ test('تغییر رمز admin: داده با کلید جدید بازرمز می
   assert.equal((await c2.post('/api/me/password', { current: 'Admin-Test-2', new: 'Admin-Test-1' })).status, 200);
 });
 
+test('قفل: DELETE مخاطب و پشتیبان هم در حالت قفل 401 می‌دهند', async () => {
+  enc.clearDek();
+  try {
+    const oc = client();
+    await oc.login('oper', 'Operator-Test-1');
+    // در حالت قفل، جستجو هم 401 است، پس شناسه را از دیتابیس می‌خوانیم
+    // تا مسیر DELETE مستقیم تست شود
+    const pid = db.prepare('SELECT id FROM persons WHERE last_name = ?').get('کریمی').id;
+    assert.equal((await oc.del('/api/persons/' + pid)).status, 401);
+    assert.equal((await oc.post('/api/backup', {})).status, 401);
+    assert.ok(db.prepare('SELECT 1 FROM persons WHERE id = ?').get(pid), 'در حالت قفل نباید چیزی حذف شود');
+  } finally {
+    enc.setDek(await enc.deriveDek('Admin-Test-1', ctx.salt));
+  }
+});
+
+test('چرخش CLI در حین اجرا: سرور قفل می‌شود و ورود با رمز جدید بازش می‌کند', async () => {
+  const oc = client();
+  await oc.login('oper', 'Operator-Test-1');
+  assert.equal((await oc.get('/api/persons')).status, 200);
+  // شبیه‌سازی دقیق manage.js set-password admin در پروسه جدا: بازرمز
+  // با کلید جدید + به‌روزرسانی اثر انگشت، بدون دست‌کاری حافظه سرور
+  const { transaction } = require('../lib/db');
+  const oldDek = await enc.deriveDek('Admin-Test-1', ctx.salt);
+  const newDek = await enc.deriveDek('Admin-CLI-Test-1', ctx.salt);
+  const newHash = await auth.hashPassword('Admin-CLI-Test-1');
+  transaction(db, () => {
+    enc.reencryptAll(db, oldDek, newDek);
+    db.prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = (SELECT id FROM users WHERE username = ?)')
+      .run(newHash, 'admin');
+    enc.writeDekFingerprint(db, newDek);
+  });
+  // درخواست بعدی operator باید قفل‌شده برگردد، نه اینکه با کلید قدیمی
+  // بخواند یا بنویسد
+  const locked = await oc.get('/api/persons');
+  assert.equal(locked.status, 401);
+  assert.equal(locked.data.code, 'locked');
+  // ورود admin با رمز جدید قفل را باز می‌کند و داده خوانا می‌ماند
+  const ac = client();
+  await ac.login('admin', 'Admin-CLI-Test-1');
+  const back = await ac.post('/api/me/password', { current: 'Admin-CLI-Test-1', new: 'Admin-Test-1' });
+  assert.equal(back.status, 200, JSON.stringify(back.data));
+  const oc2 = client();
+  await oc2.login('oper', 'Operator-Test-1');
+  assert.equal((await oc2.get('/api/persons?q=' + FAKE_MOBILE)).data.items[0].mobile, FAKE_MOBILE);
+});
+
+test('پشتیبان: دیتابیس دارای مقدار رمزنشده، پشتیبان نمی‌سازد', async () => {
+  const now = Date.now();
+  const res = db.prepare(
+    `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+       mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+     VALUES (?, ?, '', NULL, '', '', ?, '', '', '', '', '', ?, ?)`,
+  ).run('پشتیبان', 'رمزنشده', '09000004444', now, now);
+  const id = Number(res.lastInsertRowid);
+  try {
+    assert.throws(() => dir.backupDb(db, path.join(tmp, 'data')), /رمزنشده/);
+  } finally {
+    db.prepare('DELETE FROM persons WHERE id = ?').run(id);
+  }
+});
+
+test('مهاجرت: آدرس قدیمی با پیشوند enc1: رمز می‌شود و جستجو خراب نمی‌شود', async () => {
+  const now = Date.now();
+  const res = db.prepare(
+    `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+       mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+     VALUES (?, ?, '', NULL, '3998', '', '09000005555', '', '', ?, '', '', ?, ?)`,
+  ).run('پیشوندی', 'قدیمی', 'enc1: reception', now, now);
+  const id = Number(res.lastInsertRowid);
+  enc.clearDek();
+  const c = client();
+  await c.login('admin', 'Admin-Test-1');
+  const raw = db.prepare('SELECT address FROM persons WHERE id = ?').get(id).address;
+  assert.ok(enc.isEncrypted(raw), raw);
+  assert.equal(enc.decryptValue(await enc.deriveDek('Admin-Test-1', ctx.salt), raw), 'enc1: reception');
+  const oc = client();
+  await oc.login('oper', 'Operator-Test-1');
+  assert.equal((await oc.get('/api/persons?q=' + encodeURIComponent('پیشوندی'))).data.total, 1);
+  assert.equal((await oc.get('/api/persons/' + id)).data.person.address, 'enc1: reception');
+});
+
 test('محدودیت تلاش ناموفق ورود: ۱۰ شکست و سپس ۴۲۹', async () => {
   const c = client();
   let last;

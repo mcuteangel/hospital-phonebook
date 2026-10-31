@@ -90,3 +90,46 @@ test('crypto: دو بار رمز کردن یک مقدار، خروجی متفا�
   const key = Buffer.alloc(32, 7);
   assert.notEqual(enc.encryptValue(key, '09000001111'), enc.encryptValue(key, '09000001111'));
 });
+
+test('crypto: isEncrypted فقط پاکت کامل را قبول می‌کند، نه صرف پیشوند را', () => {
+  const key = Buffer.alloc(32, 7);
+  const real = enc.encryptValue(key, '09000001111');
+  assert.equal(enc.isEncrypted(real), true);
+  assert.equal(enc.isEncrypted('enc1: reception'), false, 'آدرس قدیمی با پیشوند enc1: نباید رمز شده شمرده شود');
+  assert.equal(enc.isEncrypted('enc1:abcd:efgh'), false, 'IV با طول اشتباه پاکت معتبر نیست');
+  assert.equal(enc.isEncrypted('enc1:'), false);
+  assert.equal(enc.isEncrypted(''), false);
+  assert.equal(enc.isEncrypted('متن رمزنشده قدیمی'), false);
+  // مقدار قدیمیِ دارای پیشوند، رمزگشایی‌اش همان مقدار است (نه خطا) تا
+  // مهاجرت بتواند آن را رمز کند، نه اینکه خواندن را خراب کند
+  assert.equal(enc.decryptValue(key, 'enc1: reception'), 'enc1: reception');
+});
+
+test('crypto: مهاجرت مقدار قدیمی با پیشوند enc1: را رمز می‌کند و دسته‌ای کار می‌کند', () => {
+  const { openDb } = require('../lib/db');
+  const db = openDb(':memory:');
+  try {
+    const key = Buffer.alloc(32, 7);
+    const now = Date.now();
+    const ins = db.prepare(
+      `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+         mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+       VALUES (?, ?, '', NULL, '', '', ?, '', '', ?, '', '', ?, ?)`,
+    );
+    // ۱۲۰۰ ردیف: از مرز دسته ۵۰۰تایی رد می‌شود تا دسته‌بندی تست شود
+    for (let i = 0; i < 1200; i++) {
+      ins.run('قدیمی' + i, 'ردیف', '0900000' + String(1000 + (i % 9000)).padStart(4, '0'), i === 0 ? 'enc1: reception' : '', now, now);
+    }
+    const changed = enc.migratePlaintext(db, key);
+    assert.equal(changed, 1200);
+    const first = db.prepare('SELECT mobile, address FROM persons ORDER BY id LIMIT 1').get();
+    assert.ok(enc.isEncrypted(first.mobile));
+    assert.equal(enc.decryptValue(key, first.mobile).startsWith('0900000'), true);
+    assert.ok(enc.isEncrypted(first.address));
+    assert.equal(enc.decryptValue(key, first.address), 'enc1: reception');
+    // اجرای دوباره idempotent است: چیزی برای تغییر نیست
+    assert.equal(enc.migratePlaintext(db, key), 0);
+  } finally {
+    db.close();
+  }
+});

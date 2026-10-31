@@ -94,7 +94,9 @@
       if (data.code === 'locked' && !state.locked) {
         state.locked = true;
         closeDialog();
-        refresh();
+        // عمداً await نمی‌شود: refresh خودش خطاها را می‌گیرد و نما را
+        // با پیام قفل جایگزین می‌کند؛ api نباید روی آن قفل شود
+        void refresh();
       }
       if (data.code === 'password-change-required' && !forcedPasswordOpen) passwordDialog(true);
       throw Object.assign(new Error(data.error || 'خطای ناشناخته'), { status: res.status });

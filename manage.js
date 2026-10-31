@@ -6,6 +6,7 @@
  *   node manage.js add-user <username> <operator|viewer>
  *   node manage.js set-password <username>
  *   node manage.js backup
+ *   node manage.js audit-backups   # وضعیت رمزنگاری پشتیبان‌های .db موجود
  * رمز به‌صورت تصادفی ساخته و یک بار چاپ می‌شود (رمز در تاریخچه ترمینال نمی‌ماند).
  * برای admin، رمز فعلی هرگز به‌عنوان آرگومان خط فرمان پذیرفته نمی‌شود
  * (در تاریخچه شل و فهرست پردازه‌ها دیده می‌شد)؛ در عوض با پرامپت
@@ -95,6 +96,9 @@ async function cmdSetPassword(db, username, argvPassword) {
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
   }
   console.log(`رمز جدید «${username}»: ${password}`);
+  if (username.toLowerCase() === 'admin' && row.role === 'operator') {
+    console.log('توجه: اگر سرور در حال اجراست، در اولین درخواست operator خودش را قفل می‌کند؛ admin باید با رمز جدید وارد شود تا داده حساس دوباره در دسترس شود.');
+  }
 }
 
 async function main() {
@@ -125,8 +129,21 @@ async function main() {
       console.log(`پشتیبان ساخته شد: ${cfg.dataDir}/backups/${dir.backupDb(db, cfg.dataDir)}`);
       break;
     }
+    case 'audit-backups': {
+      const results = dir.auditBackups(cfg.dataDir);
+      if (results.length === 0) {
+        console.log('پشتیبانی در backups/ نیست.');
+        break;
+      }
+      for (const r of results) {
+        if (r.error) console.log(`${r.file}: بررسی نشد (${r.error})`);
+        else if (r.plaintext) console.log(`${r.file}: رمزنشده — حذف یا در جای امن نگه دارید`);
+        else console.log(`${r.file}: رمز شده`);
+      }
+      break;
+    }
     default:
-      console.log('دستورها: list-users | add-user <username> <operator|viewer> | set-password <username> | backup');
+      console.log('دستورها: list-users | add-user <username> <operator|viewer> | set-password <username> | backup | audit-backups');
   }
   db.close();
 }

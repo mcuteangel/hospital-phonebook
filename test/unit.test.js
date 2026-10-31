@@ -105,6 +105,39 @@ test('crypto: isEncrypted فقط پاکت کامل را قبول می‌کند،
   assert.equal(enc.decryptValue(key, 'enc1: reception'), 'enc1: reception');
 });
 
+test('directory: auditBackups پشتیبان رمزنشده را از رمز شده جدا می‌کند', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { openDb } = require('../lib/db');
+  const dir = require('../lib/directory');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phonebook-audit-'));
+  try {
+    const backups = path.join(tmp, 'backups');
+    fs.mkdirSync(backups, { recursive: true });
+    const now = Date.now();
+    const mk = (file, mobile) => {
+      const db = openDb(path.join(backups, file));
+      db.prepare(
+        `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+           mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+         VALUES (?, '', '', NULL, '', '', ?, '', '', '', '', '', ?, ?)`,
+      ).run('الف', mobile, now, now);
+      db.close();
+    };
+    mk('plain.db', '09000001111');
+    const key = Buffer.alloc(32, 7);
+    mk('enc.db', enc.encryptValue(key, '09000001111'));
+    const results = dir.auditBackups(tmp);
+    const byFile = Object.fromEntries(results.map((r) => [r.file, r.plaintext]));
+    assert.equal(byFile['plain.db'], true);
+    assert.equal(byFile['enc.db'], false);
+    assert.deepEqual(dir.auditBackups(path.join(tmp, 'nope')), []);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('crypto: مهاجرت مقدار قدیمی با پیشوند enc1: را رمز می‌کند و دسته‌ای کار می‌کند', () => {
   const { openDb } = require('../lib/db');
   const db = openDb(':memory:');

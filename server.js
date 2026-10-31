@@ -359,7 +359,12 @@ function createApp({ db, publicDir, dataDir }) {
     // (اثر ثبت‌نشده = بررسی بی‌اثر، برای سازگاری با دیتابیس‌های قدیمی.)
     if (user?.role === 'operator' && enc.getDek()) {
       const fp = enc.readDekFingerprint(db);
-      if (fp && fp !== enc.dekFingerprint(enc.getDek())) enc.clearDek();
+      if (fp && fp !== enc.dekFingerprint(enc.getDek())) {
+        // چرخش رمز از CLI در حین اجرا: قفل‌شدن را در لاگ سرور هم ثبت
+        // می‌کنیم تا اپراتور بفهمد چرا داده حساس ناگهان 401 می‌دهد
+        console.warn('قفل داده حساس: اثر انگشت کلید با ذخیره‌شده نمی‌خواند (احتمالاً رمز admin با manage.js چرخانده شده)؛ admin باید با رمز جدید وارد شود.');
+        enc.clearDek();
+      }
     }
     // داده حساس قفل است تا وقتی admin از زمان راه‌اندازی سرور وارد نشده باشد؛
     // فقط مسیرهایی که به ستون‌های حساس می‌رسند بسته می‌شوند (viewer هرگز به آنها نمی‌رسد)
@@ -426,6 +431,18 @@ async function main() {
       db.prepare('UPDATE users SET role = ?, must_change_password = 1 WHERE id = ?').run('operator', adminRow.id);
       console.log('هشدار: کاربر admin نقش viewer داشت و نمی‌توانست قفل داده حساس را باز کند؛ نقش آن به operator ارتقا یافت و در ورود بعدی تغییر رمز اجباری است.');
     }
+  }
+
+  // پشتیبان‌های قدیمیِ رمزنشده را فقط گزارش می‌کنیم، نه حذف/تغییر:
+  // پشتیبان، نقطه بازگشت است و دست‌کاری خودکارش مخرب است. ولی
+  // وضعیت‌شان در راه‌اندازی با اسم فایل هشدار داده می‌شود تا ادعای
+  // «پشتیبان‌ها رمز شده‌اند» برای فایل‌های پیش از ارتقا بی‌پاسخ نماند.
+  const audit = dir.auditBackups(cfg.dataDir);
+  const stale = audit.filter((a) => a.plaintext);
+  if (stale.length > 0) {
+    console.warn('\nهشدار: این پشتیبان‌های .db هنوز مقادیر حساس رمزنشده دارند (پیش از ارتقای رمزنگاری گرفته شده‌اند) و به‌صورت خودکار مهاجرت نمی‌شوند؛ حذف یا در جای امن نگهشان دارید:');
+    for (const a of stale) console.warn(`  - ${a.file}`);
+    console.warn('بررسی دستی: node manage.js audit-backups\n');
   }
 
   writeSnapshot(db, cfg.publicDir);

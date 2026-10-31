@@ -31,6 +31,7 @@ node manage.js list-users
 node manage.js add-user <username> <operator|viewer>   # رمز تصادفی چاپ می‌شود
 node manage.js set-password <username>                 # برای admin، رمز فعلی با پرامپت امن پرسیده می‌شود؛ هرگز آن را آرگومان خط فرمان ندهید
 node manage.js backup                                  # یا دکمه «ساخت پشتیبان» در تب مدیریت؛ اگر هنوز مقدار حساس رمزنشده‌ای باشد، پشتیبان رد می‌شود
+node manage.js audit-backups                           # وضعیت رمزنگاری پشتیبان‌های .db موجود (سرور هم در راه‌اندازی موارد رمزنشده را با اسم فایل هشدار می‌دهد)
 ```
 
 پشتیبان‌ها در `DATA_DIR/backups/` ذخیره می‌شوند (۳۰ نسخه آخر). ژورنال SQLite عمداً حالت پیش‌فرض است تا کپی دستی فایل `directory.db` هنگام بسته‌بودن سرور هم امن باشد.

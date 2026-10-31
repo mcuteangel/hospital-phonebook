@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>دفتر تلفن بیمارستان</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="skip" href="#view">پرش به محتوا</a>
+  <header class="top">
+    <h1>دفتر تلفن بیمارستان</h1>
+    <div id="userbar" class="userbar"></div>
+  </header>
+  <div id="banner" class="banner" role="status" hidden></div>
+  <nav id="tabs" class="tabs" aria-label="بخش‌ها"></nav>
+  <section id="toolbar" class="toolbar"></section>
+  <main id="view" tabindex="-1"></main>
+  <dialog id="dlg"></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <!-- فقط فهرست داخلی‌ها؛ برای حالت آفلاین (file://). هیچ داده شخصی/حساسی اینجا نیست. -->
+  <script src="internals-snapshot.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -126,25 +126,28 @@ function createApp({ db, publicDir, dataDir }) {
     }
     limiter.reset(ip);
     // فقط ورود admin قفل داده حساس را باز می‌کند (کلید از رمز او ساخته می‌شود).
-    // ترتیب عمدی است و بین آخرین await و نصب کلید هیچ awaitای نیست، چون
-    // Node تک‌نخی است و این بخش همگام، اتمی اجرا می‌شود:
-    // ۱) اگر در فاصله تأیید رمز تا ساخت کلید، رمز عوض شده باشد (تغییر
-    //    رمز هم‌زمان از API یا CLI)، هش تازه با هشِ زمان تأیید نمی‌خواند
-    //    و ورود رد می‌شود — وگرنه کلید قدیمیِ منقضی نصب می‌شد و خواندن/
-    //    نوشتن بعدی با کلید جدید خراب می‌شد.
-    // ۲) مهاجرت پیش از نصب کلید commit می‌شود؛ اگر مهاجرت خطا بدهد،
-    //    سرور قفل می‌ماند و سشنی هم ساخته نمی‌شود.
+    // «بدون await» به‌تنهایی اتمی نیست: پروسه جداگانه CLI بین دو
+    // statement جدا هم می‌تواند commit شود. پس بازبینی هش، مهاجرت و
+    // نوشتن اثر انگشت در یک تراکنش BEGIN IMMEDIATE انجام می‌شوند و
+    // کلید حافظه فقط بعد از commit آن نصب می‌شود:
+    // ۱) اگر در فاصله تأیید رمز تا ساخت کلید، رمز عوض شده باشد، هش
+    //    تازه با هشِ زمان تأیید نمی‌خواند و ورود رد می‌شود — وگرنه
+    //    کلید قدیمیِ منقضی نصب می‌شد.
+    // ۲) اگر مهاجرت خطا بدهد، تراکنش برمی‌گردد، سرور قفل می‌ماند و
+    //    سشنی هم ساخته نمی‌شود.
     // ۳) سشن فقط بعد از بازشدن موفق قفل ساخته می‌شود.
     if (row.username === 'admin' && row.role === 'operator') {
       const salt = enc.getOrCreateSalt(db);
       const dek = await enc.deriveDek(password, salt);
-      const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(row.id);
-      if (!fresh || fresh.password_hash !== row.password_hash) {
-        throw new HttpError(401, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره وارد شوید');
-      }
-      transaction(db, () => enc.migratePlaintext(db, dek));
+      transaction(db, () => {
+        const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(row.id);
+        if (!fresh || fresh.password_hash !== row.password_hash) {
+          throw new HttpError(401, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره وارد شوید');
+        }
+        enc.migratePlaintext(db, dek);
+        enc.writeDekFingerprint(db, dek);
+      });
       enc.setDek(dek);
-      enc.writeDekFingerprint(db, dek);
     }
     const token = auth.createSession(db, row.id);
     res.setHeader('Set-Cookie', sessionCookie(token, Math.floor(auth.SESSION_TTL_MS / 1000)));
@@ -172,20 +175,22 @@ function createApp({ db, publicDir, dataDir }) {
       // اگر در فاصله تأیید تا اینجا رمز از جای دیگری عوض شده باشد،
       // بازرمز با کلید قدیمی داده‌ای را که با کلید تازه رمز شده خراب
       // می‌کند؛ تراکنش هم با خطای رمزگشایی برمی‌گردد، ولی رد صریح
-      // زودتر و با پیام روشن‌تر است.
-      const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
-      if (!fresh || fresh.password_hash !== row.password_hash) {
-        throw new HttpError(400, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره امتحان کنید');
-      }
+      // زودتر و با پیام روشن‌تر است. بازبینی هش، بازرمز و نوشتن اثر
+      // انگشت در یک تراکنش‌اند: نوشتن اثر انگشت بعد از commit، پنجره‌ای
+      // می‌ساخت که چرخش CLI وسطش اثر خودش را ثبت کند و بعد اثر
+      // قدیمی روی آن نوشته شود.
       transaction(db, () => {
+        const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
+        if (!fresh || fresh.password_hash !== row.password_hash) {
+          throw new HttpError(400, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره امتحان کنید');
+        }
         enc.reencryptAll(db, oldDek, newDek);
         db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(newHash, user.id);
         db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+        enc.writeDekFingerprint(db, newDek);
       });
-      // نصب کلید فقط بعد از commit تراکنش، و بلافاصله اثر انگشت تازه؛
-      // بین این دو هیچ awaitای نیست تا درخواست دیگری وسطشان ننشیند.
+      // نصب کلید حافظه فقط بعد از commit تراکنش
       enc.setDek(newDek);
-      enc.writeDekFingerprint(db, newDek);
     } else {
       await auth.setPassword(db, user.id, b.new);
       db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);

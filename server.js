@@ -359,7 +359,10 @@ function createApp({ db, publicDir, dataDir }) {
     // (اثر ثبت‌نشده = بررسی بی‌اثر، برای سازگاری با دیتابیس‌های قدیمی.)
     if (user?.role === 'operator' && enc.getDek()) {
       const fp = enc.readDekFingerprint(db);
-      if (fp && fp !== enc.dekFingerprint(enc.getDek())) {
+      // نبودِ اثر هم قفل می‌کند، اگر این پروسه سرور قبلاً اثری ثبت
+      // کرده باشد (meta دست‌کاری/جایگزین شده) — وگرنه کلید قدیمی
+      // بی‌صدا به کار ادامه می‌داد.
+      if (fp !== enc.dekFingerprint(enc.getDek()) && (fp || enc.isFingerprintExpected())) {
         // چرخش رمز از CLI در حین اجرا: قفل‌شدن را در لاگ سرور هم ثبت
         // می‌کنیم تا اپراتور بفهمد چرا داده حساس ناگهان 401 می‌دهد
         console.warn('قفل داده حساس: اثر انگشت کلید با ذخیره‌شده نمی‌خواند (احتمالاً رمز admin با manage.js چرخانده شده)؛ admin باید با رمز جدید وارد شود.');

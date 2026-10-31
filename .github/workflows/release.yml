@@ -1,0 +1,228 @@
+name: Release
+
+# Auto-release flow, adapted from shiftyar-node's release workflow but
+# simpler, because this app has no build step and no npm packages:
+#
+# A merge to main that changes application code runs the PREPARE job: it
+# bumps the patch version in VERSION, runs tests, pushes a release/vX.Y.Z
+# branch and opens a Pull Request back to main. Mergify queues that PR
+# (see .mergify.yml); this workflow NEVER pushes to main directly.
+#
+# When the release PR merges, the landing push on main runs the FINALIZE
+# job: the tag and GitHub Release are published, with a zip of the app
+# (server.js, lib/, public/, seed.js, manage.js, README.md, VERSION).
+# The zip is rebuilt from the landing commit, so no cross-run artifact
+# plumbing is needed.
+#
+# Only merges to main can prepare a release: a direct push to main (one
+# with no merged pull request behind it) is skipped, as is any push whose
+# head commit message contains [skip release]. Doc-only changes are
+# skipped too (no application file changed).
+#
+# Manual releases still work: pushing a v* tag runs the MANUAL job (a
+# full release), and dispatching the workflow runs it as a draft release.
+#
+# Required repository settings: "Allow GitHub Actions to create and
+# approve pull requests" (Settings > Actions > General) so prepare can
+# open the release PR, and Mergify installed with queueing enabled for
+# the repo. The release PR is merged by Mergify, NOT by
+# github-actions[bot] auto-merge: pushes by github-actions[bot] do NOT
+# trigger a new workflow run, so a bot-merged release PR would never
+# run FINALIZE.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for a draft test release (e.g. v0.0.0-test)'
+        required: true
+        default: 'v0.0.0-test'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    # Decide what this push to main means. No checkout needed; this job
+    # talks to the GitHub API only. Skipped entirely for tag/dispatch runs.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+      version: ${{ steps.classify.outputs.version }}
+    steps:
+      - name: Classify push
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          mode="skip"
+          version=""
+
+          # Exact lookup: the pull request(s) associated with this landing
+          # commit. An API failure must NOT fall through to the prepare
+          # path: abort loudly so the run can be retried.
+          if ! prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+            --jq '.[] | select(.head.ref | test("^release/v[0-9]+\\.[0-9]+\\.[0-9]+$")) | [(.number | tostring), .head.ref] | @tsv' \
+            2>api_err.log); then
+            echo "::error::Failed to query PRs associated with commit ${HEAD_SHA}: $(cat api_err.log)"
+            exit 1
+          fi
+
+          if [ -n "$prs" ]; then
+            mode="finalize"
+            branch=$(printf '%s' "$prs" | head -n1 | cut -f2)
+            version="${branch#release/v}"
+          elif printf '%s' "$HEAD_MESSAGE" | grep -q '\[skip release\]'; then
+            mode="skip"
+          else
+            # Only merges to main can prepare a release. A direct push has
+            # no merged pull request behind it, so it never starts the
+            # release flow.
+            if ! merged=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+              --jq '[.[] | select(.base.ref == "main" and .merged_at != null)] | length' \
+              2>api_err2.log); then
+              echo "::error::Failed to query merged PRs: $(cat api_err2.log)"
+              exit 1
+            fi
+            if [ "$merged" = "0" ]; then
+              mode="skip"
+            else
+              if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}" \
+                --jq '.files[].filename' 2>api_err3.log); then
+                echo "::error::Failed to list changed files: $(cat api_err3.log)"
+                exit 1
+              fi
+              if printf '%s\n' "$files" | grep -qE '^(server\.js|seed\.js|manage\.js|lib/|public/)'; then
+                mode="prepare"
+              else
+                mode="skip"
+              fi
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release classification"
+            echo ""
+            echo "mode: \`$mode\`"
+            if [ -n "$version" ]; then echo "version: \`$version\`"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  prepare:
+    needs: classify
+    if: needs.classify.outputs.mode == 'prepare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+
+      - name: Test
+        run: node --test
+
+      - name: Bump version and open release PR
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(cat VERSION)
+          major=${current%%.*}; rest=${current#*.}; minor=${rest%%.*}; patch=${rest#*.}
+          next="$major.$minor.$((patch + 1))"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "release/v$next"
+          echo "$next" > VERSION
+          git add VERSION
+          git commit -m "chore: release v$next"
+          git push origin "release/v$next"
+          gh pr create --base main --head "release/v$next" --title "chore: release v$next" --body \
+            "انتشار خودکار v$next.
+
+            این PR را گردش‌کار Release ساخته است؛ Mergify آن را در صف ادغام می‌گذارد و پس از ادغام، تگ و Release گیت‌هاب با فایل zip برنامه ساخته می‌شود."
+
+  finalize:
+    needs: classify
+    if: needs.classify.outputs.mode == 'finalize'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build app zip and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.classify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$(cat VERSION)" != "$VERSION" ]; then
+            echo "::error::VERSION file ($(<VERSION)) does not match release version ($VERSION)"
+            exit 1
+          fi
+          zip -r "hospital-phonebook-v$VERSION.zip" server.js seed.js manage.js lib public README.md VERSION
+          gh release create "v$VERSION" --title "v$VERSION" \
+            --notes "دفتر تلفن بیمارستان v$VERSION" \
+            "hospital-phonebook-v$VERSION.zip"
+
+  manual:
+    # Tag pushes and workflow dispatches only (classify is skipped for them).
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build app zip and publish release
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+            draft="--draft"
+          else
+            tag="${GITHUB_REF_NAME}"
+            draft=""
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          zip -r "hospital-phonebook-v$version.zip" server.js seed.js manage.js lib public README.md VERSION
+          # shellcheck disable=SC2086
+          gh release create "$tag" --title "$tag" \
+            --notes "دفتر تلفن بیمارستان $tag" \
+            $draft "hospital-phonebook-v$version.zip"

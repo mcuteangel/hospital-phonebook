@@ -1,6 +1,6 @@
 'use strict';
 (function () {
-  const state = { user: null, groups: [], tab: 'internals', q: '', group: '', type: '', offline: false };
+  const state = { user: null, groups: [], tab: 'internals', q: '', group: '', type: '', offline: false, locked: false };
   let forcedPasswordOpen = false;
   const $ = (sel) => document.querySelector(sel);
   const fa = (n) => Number(n).toLocaleString('fa-IR');
@@ -79,15 +79,29 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (res.status === 401 && state.user) {
+      if (res.status === 401 && data.code !== 'locked' && state.user) {
         state.user = null;
         state.tab = 'internals';
         renderAll();
         toast('نشست شما پایان یافت؛ دوباره وارد شوید');
       }
+      // قفل‌شدن، خروج از حساب نیست (ادمین می‌تواند از تب دیگر قفل را
+      // باز کند) ولی مقادیر حساسی که از قبل نمایش داده شده‌اند نباید
+      // روی صفحه بمانند: دیالوگ باز بسته می‌شود و نما با خطای قفل
+      // جایگزین می‌شود. پرچم locked فقط از تکرار این پاک‌سازی در
+      // همان دوره قفل جلوگیری می‌کند؛ هر پاسخ موفق آن را برمی‌گرداند
+      // تا قفل بعدی دوباره پاک‌سازی شود.
+      if (data.code === 'locked' && !state.locked) {
+        state.locked = true;
+        closeDialog();
+        // عمداً await نمی‌شود: refresh خودش خطاها را می‌گیرد و نما را
+        // با پیام قفل جایگزین می‌کند؛ api نباید روی آن قفل شود
+        void refresh();
+      }
       if (data.code === 'password-change-required' && !forcedPasswordOpen) passwordDialog(true);
       throw Object.assign(new Error(data.error || 'خطای ناشناخته'), { status: res.status });
     }
+    state.locked = false;
     return data;
   }
 

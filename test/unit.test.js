@@ -6,6 +6,7 @@ const { toLatinDigits, cleanText, searchKey } = require('../lib/text');
 const { parseCsv, stringifyCsv, safeCell } = require('../lib/csv');
 const { parsePerson } = require('../lib/directory');
 const auth = require('../lib/auth');
+const enc = require('../lib/crypto');
 
 test('toLatinDigits: ارقام فارسی و عربی به لاتین', () => {
   assert.equal(toLatinDigits('۰۹۱۲٣٤٥'), '0912345');
@@ -63,4 +64,166 @@ test('scrypt: هش و تأیید رمز؛ هش ثابت نیست', async () => {
   assert.equal(await auth.verifyPassword('Secret-123', h1), true);
   assert.equal(await auth.verifyPassword('wrong', h1), false);
   assert.equal(await auth.verifyPassword('anything', null), false);
+});
+
+test('crypto: رفت‌وبرگشت AES-GCM؛ رشته خالی همان خالی می‌ماند', () => {
+  const key = Buffer.alloc(32, 7);
+  const cipher = enc.encryptValue(key, '09000001111');
+  assert.ok(cipher.startsWith('enc1:'));
+  assert.notEqual(cipher, '09000001111');
+  assert.equal(enc.decryptValue(key, cipher), '09000001111');
+  assert.equal(enc.encryptValue(key, ''), '');
+  assert.equal(enc.decryptValue(key, ''), '');
+  assert.equal(enc.decryptValue(key, 'متن رمزنشده قدیمی'), 'متن رمزنشده قدیمی');
+});
+
+test('crypto: کلید اشتباه یا متن دست‌کاری‌شده رمزگشایی نمی‌شود', () => {
+  const key = Buffer.alloc(32, 7);
+  const other = Buffer.alloc(32, 9);
+  const cipher = enc.encryptValue(key, '09000001111');
+  assert.throws(() => enc.decryptValue(other, cipher));
+  const tampered = cipher.slice(0, -2) + (cipher.endsWith('A') ? 'B' : 'A');
+  assert.throws(() => enc.decryptValue(key, tampered));
+});
+
+test('crypto: دو بار رمز کردن یک مقدار، خروجی متفاوت می‌دهد (IV تصادفی)', () => {
+  const key = Buffer.alloc(32, 7);
+  assert.notEqual(enc.encryptValue(key, '09000001111'), enc.encryptValue(key, '09000001111'));
+});
+
+test('crypto: isEncrypted فقط پاکت کامل را قبول می‌کند، نه صرف پیشوند را', () => {
+  const key = Buffer.alloc(32, 7);
+  const real = enc.encryptValue(key, '09000001111');
+  assert.equal(enc.isEncrypted(real), true);
+  assert.equal(enc.isEncrypted('enc1: reception'), false, 'آدرس قدیمی با پیشوند enc1: نباید رمز شده شمرده شود');
+  assert.equal(enc.isEncrypted('enc1:abcd:efgh'), false, 'IV با طول اشتباه پاکت معتبر نیست');
+  assert.equal(enc.isEncrypted('enc1:'), false);
+  assert.equal(enc.isEncrypted(''), false);
+  assert.equal(enc.isEncrypted('متن رمزنشده قدیمی'), false);
+  // مقدار قدیمیِ دارای پیشوند، رمزگشایی‌اش همان مقدار است (نه خطا) تا
+  // مهاجرت بتواند آن را رمز کند، نه اینکه خواندن را خراب کند
+  assert.equal(enc.decryptValue(key, 'enc1: reception'), 'enc1: reception');
+});
+
+test('directory: auditBackups پشتیبان رمزنشده را از رمز شده جدا می‌کند', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { openDb } = require('../lib/db');
+  const dir = require('../lib/directory');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phonebook-audit-'));
+  try {
+    const backups = path.join(tmp, 'backups');
+    fs.mkdirSync(backups, { recursive: true });
+    const now = Date.now();
+    const mk = (file, mobile) => {
+      const db = openDb(path.join(backups, file));
+      db.prepare(
+        `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+           mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+         VALUES (?, '', '', NULL, '', '', ?, '', '', '', '', '', ?, ?)`,
+      ).run('الف', mobile, now, now);
+      db.close();
+    };
+    mk('plain.db', '09000001111');
+    const key = Buffer.alloc(32, 7);
+    mk('enc.db', enc.encryptValue(key, '09000001111'));
+    const results = dir.auditBackups(tmp);
+    const byFile = Object.fromEntries(results.map((r) => [r.file, r.plaintext]));
+    assert.equal(byFile['plain.db'], true);
+    assert.equal(byFile['enc.db'], false);
+    assert.deepEqual(dir.auditBackups(path.join(tmp, 'nope')), []);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('directory: auditBackups پشتیبان بزرگ را دسته‌ای اسکن می‌کند (متن خوانا در ردیف آخر هم پیدا می‌شود)', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { openDb } = require('../lib/db');
+  const dir = require('../lib/directory');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phonebook-audit-big-'));
+  try {
+    const backups = path.join(tmp, 'backups');
+    fs.mkdirSync(backups, { recursive: true });
+    const key = Buffer.alloc(32, 7);
+    const now = Date.now();
+    const db = openDb(path.join(backups, 'big.db'));
+    const ins = db.prepare(
+      `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+         mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+       VALUES (?, '', '', NULL, '', '', ?, '', '', '', '', '', ?, ?)`,
+    );
+    // ۱۲۰۰ ردیف: فقط آخرین ردیف رمزنشده است، پس اسکن باید از مرز
+    // دسته ۵۰۰تایی بگذرد تا آن را پیدا کند
+    for (let i = 0; i < 1200; i++) {
+      ins.run('ردیف' + i, i === 1199 ? '09000001111' : enc.encryptValue(key, '09000001111'), now, now);
+    }
+    db.close();
+    const results = dir.auditBackups(tmp);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].plaintext, true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('directory: نوشتن با کلید کهنه (چرخش CLI وسط خواندن بدنه) با 401 قفل رد می‌شود و ردیفی ساخته نمی‌شود', () => {
+  const { openDb } = require('../lib/db');
+  const dir = require('../lib/directory');
+  const db = openDb(':memory:');
+  try {
+    const oldKey = Buffer.alloc(32, 7);
+    const newKey = Buffer.alloc(32, 9);
+    // شبیه‌سازی چرخش CLI: کلید حافظه هنوز قدیمی است ولی اثر انگشت
+    // ذخیره‌شده در meta از کلید جدید است
+    enc.setDek(oldKey);
+    enc.writeDekFingerprint(db, newKey);
+    assert.throws(
+      () => dir.createPerson(db, { first_name: 'الف', last_name: 'ب', mobile: '09000001111' }),
+      (err) => err.code === 'locked' && err.status === 401,
+    );
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM persons').get().c, 0);
+    assert.equal(enc.getDek(), null);
+    // شاهد مثبت: با اثر انگشتِ مطابق، همان نوشتن موفق است
+    enc.setDek(newKey);
+    enc.writeDekFingerprint(db, newKey);
+    const id = dir.createPerson(db, { first_name: 'الف', last_name: 'ب', mobile: '09000001111' });
+    assert.ok(id);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM persons').get().c, 1);
+  } finally {
+    enc.clearDek();
+    db.close();
+  }
+});
+
+test('crypto: مهاجرت مقدار قدیمی با پیشوند enc1: را رمز می‌کند و دسته‌ای کار می‌کند', () => {
+  const { openDb } = require('../lib/db');
+  const db = openDb(':memory:');
+  try {
+    const key = Buffer.alloc(32, 7);
+    const now = Date.now();
+    const ins = db.prepare(
+      `INSERT INTO persons (first_name, last_name, title, group_id, extension, direct_line,
+         mobile, home_phone, email, address, national_id, note, created_at, updated_at)
+       VALUES (?, ?, '', NULL, '', '', ?, '', '', ?, '', '', ?, ?)`,
+    );
+    // ۱۲۰۰ ردیف: از مرز دسته ۵۰۰تایی رد می‌شود تا دسته‌بندی تست شود
+    for (let i = 0; i < 1200; i++) {
+      ins.run('قدیمی' + i, 'ردیف', '0900000' + String(1000 + (i % 9000)).padStart(4, '0'), i === 0 ? 'enc1: reception' : '', now, now);
+    }
+    const changed = enc.migratePlaintext(db, key);
+    assert.equal(changed, 1200);
+    const first = db.prepare('SELECT mobile, address FROM persons ORDER BY id LIMIT 1').get();
+    assert.ok(enc.isEncrypted(first.mobile));
+    assert.equal(enc.decryptValue(key, first.mobile).startsWith('0900000'), true);
+    assert.ok(enc.isEncrypted(first.address));
+    assert.equal(enc.decryptValue(key, first.address), 'enc1: reception');
+    // اجرای دوباره idempotent است: چیزی برای تغییر نیست
+    assert.equal(enc.migratePlaintext(db, key), 0);
+  } finally {
+    db.close();
+  }
 });

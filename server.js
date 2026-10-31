@@ -5,9 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { loadConfig, requireNode22 } = require('./lib/config');
-const { openDb } = require('./lib/db');
+const { openDb, transaction } = require('./lib/db');
 const auth = require('./lib/auth');
 const dir = require('./lib/directory');
+const enc = require('./lib/crypto');
 const { writeSnapshot } = require('./lib/snapshot');
 const { HttpError } = require('./lib/errors');
 
@@ -87,6 +88,19 @@ function intParam(value, label) {
   return Number(value);
 }
 
+function isSensitiveOperatorRoute(method, pathname) {
+  if (pathname === '/api/persons' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/persons\/\d+$/.test(pathname) && (method === 'GET' || method === 'PUT' || method === 'DELETE')) return true;
+  if (pathname === '/api/recents' && method === 'GET') return true;
+  if (pathname === '/api/export.csv' && method === 'GET') return true;
+  if (pathname === '/api/import' && method === 'POST') return true;
+  // پشتیبان هم داده حساس است: پیش از مهاجرت (قفل) نباید یک کپی
+  // رمزنشده از دیتابیس ساخته شود؛ بعد از بازشدن قفل، مهاجرت انجام
+  // شده و پشتیبان رمز شده است. خود backupDb هم ردیف رمزنشده را رد می‌کند.
+  if (pathname === '/api/backup' && method === 'POST') return true;
+  return false;
+}
+
 function createApp({ db, publicDir, dataDir }) {
   const limiter = auth.createLimiter();
   const routes = [];
@@ -111,6 +125,30 @@ function createApp({ db, publicDir, dataDir }) {
       throw new HttpError(401, 'نام کاربری یا رمز عبور اشتباه است');
     }
     limiter.reset(ip);
+    // فقط ورود admin قفل داده حساس را باز می‌کند (کلید از رمز او ساخته می‌شود).
+    // «بدون await» به‌تنهایی اتمی نیست: پروسه جداگانه CLI بین دو
+    // statement جدا هم می‌تواند commit شود. پس بازبینی هش، مهاجرت و
+    // نوشتن اثر انگشت در یک تراکنش BEGIN IMMEDIATE انجام می‌شوند و
+    // کلید حافظه فقط بعد از commit آن نصب می‌شود:
+    // ۱) اگر در فاصله تأیید رمز تا ساخت کلید، رمز عوض شده باشد، هش
+    //    تازه با هشِ زمان تأیید نمی‌خواند و ورود رد می‌شود — وگرنه
+    //    کلید قدیمیِ منقضی نصب می‌شد.
+    // ۲) اگر مهاجرت خطا بدهد، تراکنش برمی‌گردد، سرور قفل می‌ماند و
+    //    سشنی هم ساخته نمی‌شود.
+    // ۳) سشن فقط بعد از بازشدن موفق قفل ساخته می‌شود.
+    if (row.username === 'admin' && row.role === 'operator') {
+      const salt = enc.getOrCreateSalt(db);
+      const dek = await enc.deriveDek(password, salt);
+      transaction(db, () => {
+        const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(row.id);
+        if (!fresh || fresh.password_hash !== row.password_hash) {
+          throw new HttpError(401, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره وارد شوید');
+        }
+        enc.migratePlaintext(db, dek);
+        enc.writeDekFingerprint(db, dek);
+      });
+      enc.setDek(dek);
+    }
     const token = auth.createSession(db, row.id);
     res.setHeader('Set-Cookie', sessionCookie(token, Math.floor(auth.SESSION_TTL_MS / 1000)));
     send(res, 200, { user: { username: row.username, role: row.role, mustChangePassword: row.must_change_password === 1 } });
@@ -127,8 +165,36 @@ function createApp({ db, publicDir, dataDir }) {
     const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
     const ok = await auth.verifyPassword(typeof b.current === 'string' ? b.current : '', row.password_hash);
     if (!ok) throw new HttpError(400, 'رمز فعلی اشتباه است');
-    await auth.setPassword(db, user.id, b.new);
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+    if (user.username === 'admin' && user.role === 'operator') {
+      // کلید داده از رمز admin ساخته می‌شود: همه ستون‌ها را با کلید جدید بازرمز می‌کنیم
+      auth.validatePassword(b.new);
+      const salt = enc.getOrCreateSalt(db);
+      const oldDek = await enc.deriveDek(typeof b.current === 'string' ? b.current : '', salt);
+      const newDek = await enc.deriveDek(b.new, salt);
+      const newHash = await auth.hashPassword(b.new);
+      // اگر در فاصله تأیید تا اینجا رمز از جای دیگری عوض شده باشد،
+      // بازرمز با کلید قدیمی داده‌ای را که با کلید تازه رمز شده خراب
+      // می‌کند؛ تراکنش هم با خطای رمزگشایی برمی‌گردد، ولی رد صریح
+      // زودتر و با پیام روشن‌تر است. بازبینی هش، بازرمز و نوشتن اثر
+      // انگشت در یک تراکنش‌اند: نوشتن اثر انگشت بعد از commit، پنجره‌ای
+      // می‌ساخت که چرخش CLI وسطش اثر خودش را ثبت کند و بعد اثر
+      // قدیمی روی آن نوشته شود.
+      transaction(db, () => {
+        const fresh = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
+        if (!fresh || fresh.password_hash !== row.password_hash) {
+          throw new HttpError(400, 'رمز عبور در این فاصله تغییر کرده است؛ دوباره امتحان کنید');
+        }
+        enc.reencryptAll(db, oldDek, newDek);
+        db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(newHash, user.id);
+        db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+        enc.writeDekFingerprint(db, newDek);
+      });
+      // نصب کلید حافظه فقط بعد از commit تراکنش
+      enc.setDek(newDek);
+    } else {
+      await auth.setPassword(db, user.id, b.new);
+      db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, user.tokenHash);
+    }
     send(res, 200, { ok: true });
   });
 
@@ -287,9 +353,25 @@ function createApp({ db, publicDir, dataDir }) {
       throw new HttpError(403, 'دسترسی کافی ندارید', 'forbidden');
     }
     // تا وقتی رمز اجباری عوض نشده، فقط خروج و تغییر رمز مجازند
-    if (user && user.mustChangePassword && (found.rt.access === 'user' || found.rt.access === 'operator')
+    if (user?.mustChangePassword && (found.rt.access === 'user' || found.rt.access === 'operator')
         && pathname !== '/api/logout' && pathname !== '/api/me/password') {
       throw new HttpError(403, 'ابتدا رمز عبور خود را تغییر دهید', 'password-change-required');
+    }
+    // اگر CLI در حین اجرای سرور رمز admin را چرخانده باشد، اثر انگشت
+    // ذخیره‌شده با کلید حافظه نمی‌خواند: سرور خودش را قفل می‌کند تا
+    // ورود بعدی admin با رمز جدید، کلید تازه را نصب کند. بدون این
+    // بررسی، نوشتن‌های بعدی با کلید قدیمی، داده دورگه می‌ساختند.
+    // (اثر ثبت‌نشده = بررسی بی‌اثر، برای سازگاری با دیتابیس‌های قدیمی.)
+    if (user?.role === 'operator' && enc.getDek() && enc.isDekStale(db)) {
+      // چرخش رمز از CLI در حین اجرا: قفل‌شدن را در لاگ سرور هم ثبت
+      // می‌کنیم تا اپراتور بفهمد چرا داده حساس ناگهان 401 می‌دهد
+      console.warn('قفل داده حساس: اثر انگشت کلید با ذخیره‌شده نمی‌خواند (احتمالاً رمز admin با manage.js چرخانده شده)؛ admin باید با رمز جدید وارد شود.');
+      enc.clearDek();
+    }
+    // داده حساس قفل است تا وقتی admin از زمان راه‌اندازی سرور وارد نشده باشد؛
+    // فقط مسیرهایی که به ستون‌های حساس می‌رسند بسته می‌شوند (viewer هرگز به آنها نمی‌رسد)
+    if (user?.role === 'operator' && !enc.getDek() && isSensitiveOperatorRoute(req.method, pathname)) {
+      throw new HttpError(401, enc.LOCKED_MESSAGE, 'locked');
     }
     const url = new URL(req.url, 'http://localhost');
     await found.rt.handler({ req, res, user, params: found.params, query: url.searchParams });
@@ -320,6 +402,7 @@ async function main() {
   const cfg = loadConfig();
   const db = openDb(cfg.dbFile);
   auth.purgeExpired(db);
+  enc.getOrCreateSalt(db);
 
   if (!db.prepare('SELECT 1 FROM users LIMIT 1').get()) {
     const password = auth.generatePassword();
@@ -330,6 +413,38 @@ async function main() {
     console.log(`  رمز عبور:   ${password}`);
     console.log('در اولین ورود، تغییر رمز عبور اجباری است؛ تا وقتی رمز عوض نشود، بقیه بخش‌ها باز نمی‌شوند.');
     console.log('────────────────────────────\n');
+  } else {
+    // نصب‌های قدیمی (پیش از رمزنگاری) ممکن است اصلاً کاربر admin نداشته
+    // باشند یا adminشان viewer باشد؛ در هر دو حالت قفل داده حساس هیچ‌وقت
+    // باز نمی‌شد، چون بازشدن قفل فقط با ورود adminِ operator ممکن است.
+    // پس در راه‌اندازی، حساب بازکننده تضمین می‌شود — نه با خطا و توقف
+    // سرور، که داخلی‌ها و viewer را هم می‌بست.
+    const adminRow = db.prepare('SELECT id, role FROM users WHERE username = ?').get('admin');
+    if (!adminRow) {
+      const password = auth.generatePassword();
+      await auth.createUser(db, 'admin', 'operator', password, { mustChangePassword: true });
+      console.log('\n──────── حساب admin ساخته شد ────────');
+      console.log('نصب قدیمی بدون کاربر admin بود؛ برای بازکردن قفل داده حساس، admin ساخته شد (این رمز فقط همین یک بار نمایش داده می‌شود):');
+      console.log(`  نام کاربری: admin`);
+      console.log(`  رمز عبور:   ${password}`);
+      console.log('در اولین ورود، تغییر رمز عبور اجباری است.');
+      console.log('────────────────────────────\n');
+    } else if (adminRow.role !== 'operator') {
+      db.prepare('UPDATE users SET role = ?, must_change_password = 1 WHERE id = ?').run('operator', adminRow.id);
+      console.log('هشدار: کاربر admin نقش viewer داشت و نمی‌توانست قفل داده حساس را باز کند؛ نقش آن به operator ارتقا یافت و در ورود بعدی تغییر رمز اجباری است.');
+    }
+  }
+
+  // پشتیبان‌های قدیمیِ رمزنشده را فقط گزارش می‌کنیم، نه حذف/تغییر:
+  // پشتیبان، نقطه بازگشت است و دست‌کاری خودکارش مخرب است. ولی
+  // وضعیت‌شان در راه‌اندازی با اسم فایل هشدار داده می‌شود تا ادعای
+  // «پشتیبان‌ها رمز شده‌اند» برای فایل‌های پیش از ارتقا بی‌پاسخ نماند.
+  const audit = dir.auditBackups(cfg.dataDir);
+  const stale = audit.filter((a) => a.plaintext);
+  if (stale.length > 0) {
+    console.warn('\nهشدار: این پشتیبان‌های .db هنوز مقادیر حساس رمزنشده دارند (پیش از ارتقای رمزنگاری گرفته شده‌اند) و به‌صورت خودکار مهاجرت نمی‌شوند؛ حذف یا در جای امن نگهشان دارید:');
+    for (const a of stale) console.warn(`  - ${a.file}`);
+    console.warn('بررسی دستی: node manage.js audit-backups\n');
   }
 
   writeSnapshot(db, cfg.publicDir);

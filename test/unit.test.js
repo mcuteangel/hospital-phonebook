@@ -1,0 +1,66 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { toLatinDigits, cleanText, searchKey } = require('../lib/text');
+const { parseCsv, stringifyCsv, safeCell } = require('../lib/csv');
+const { parsePerson } = require('../lib/directory');
+const auth = require('../lib/auth');
+
+test('toLatinDigits: ارقام فارسی و عربی به لاتین', () => {
+  assert.equal(toLatinDigits('۰۹۱۲٣٤٥'), '0912345');
+});
+
+test('cleanText: ی/ک عربی یکسان و فاصله‌ها فشرده می‌شوند', () => {
+  assert.equal(cleanText('  علي   كريمي \n'), 'علی کریمی');
+});
+
+test('searchKey: نیم‌فاصله و اعراب حذف و ارقام لاتین می‌شوند', () => {
+  assert.equal(searchKey('می‌خواهم ۱۲۳'), 'میخواهم 123');
+  assert.equal(searchKey('كَريمي'), 'کریمی');
+});
+
+test('parseCsv: کوتیشن، ویرگول و خط جدید داخل فیلد، BOM', () => {
+  const rows = parseCsv('﻿a,b\r\n"x,1","he said ""hi""\nline2"\r\n');
+  assert.deepEqual(rows, [['a', 'b'], ['x,1', 'he said "hi"\nline2']]);
+});
+
+test('parseCsv: جداکننده نقطه‌ویرگول تشخیص داده می‌شود', () => {
+  assert.deepEqual(parseCsv('a;b\n1;2\n'), [['a', 'b'], ['1', '2']]);
+});
+
+test('safeCell: جلوگیری از formula injection ولی شماره با + سالم می‌ماند', () => {
+  assert.equal(safeCell('=1+1'), "'=1+1");
+  assert.equal(safeCell('@SUM(A1)'), "'@SUM(A1)");
+  assert.equal(safeCell('-cmd'), "'-cmd");
+  assert.equal(safeCell('+98912'), '+98912');
+  assert.equal(safeCell('علی'), 'علی');
+});
+
+test('stringifyCsv/parseCsv رفت‌وبرگشت', () => {
+  const rows = [['نام', 'یادداشت'], ['علی', 'خط۱\nخط۲, "نقل"']];
+  assert.deepEqual(parseCsv(stringifyCsv(rows)), rows);
+});
+
+test('parsePerson: نرمال‌سازی و اعتبارسنجی', () => {
+  const p = parsePerson({ first_name: ' علي ', mobile: '۰۹۰۰-۰۰۰ ۱۲۳۴', national_id: '۰۰۰۰۰۰۱۲۳۴', extension: '۳۱۰۰' });
+  assert.equal(p.first_name, 'علی');
+  assert.equal(p.mobile, '09000001234');
+  assert.equal(p.national_id, '0000001234');
+  assert.equal(p.extension, '3100');
+  assert.equal(p.group_id, null);
+  assert.throws(() => parsePerson({}), /الزامی/);
+  assert.throws(() => parsePerson({ first_name: 'a', national_id: '123' }), /۱۰ رقم/);
+  assert.throws(() => parsePerson({ first_name: 'a', extension: '12ab' }), /کد داخلی/);
+  assert.throws(() => parsePerson({ first_name: 'a', email: 'nope' }), /ایمیل/);
+  assert.throws(() => parsePerson({ first_name: { x: 1 } }), /نامعتبر/);
+});
+
+test('scrypt: هش و تأیید رمز؛ هش ثابت نیست', async () => {
+  const h1 = await auth.hashPassword('Secret-123');
+  const h2 = await auth.hashPassword('Secret-123');
+  assert.notEqual(h1, h2);
+  assert.equal(await auth.verifyPassword('Secret-123', h1), true);
+  assert.equal(await auth.verifyPassword('wrong', h1), false);
+  assert.equal(await auth.verifyPassword('anything', null), false);
+});
